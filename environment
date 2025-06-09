@@ -1,0 +1,8 @@
+PORT=8080
+ONION_SERVER=peannyjkqwqfynd24p6dszvtchkq7hfkwymi5by5y332wmosy5dwfaqd.onion
+ONION_PORT=119
+TOR_PROXY=127.0.0.1:9050
+STEALTH_MODE=true
+NNTP_USERNAME=
+NNTP_PASSWORD=
+POSTING_URL=http://itcxzfm2h36hfj6j7qxksyfm4ipp3co4rkl62sgge7hp6u77lbretiyd.onion:8880/
