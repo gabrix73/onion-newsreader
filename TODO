@@ -1,0 +1,77 @@
+📋 TODO List - Newsreader Improvements
+🧵 PRIORITY 1: Threading Implementation
+❌ Current Issue
+
+Articles and replies appear as separate posts
+No visual thread grouping
+No hierarchical display of conversations
+Missing parent-child relationship indication
+
+✅ Required Changes
+1.1 Backend Threading Logic
+
+ Parse References header to build thread relationships
+ Parse In-Reply-To header for direct parent identification
+ Create thread structure with parent-child mapping
+ Implement thread sorting (chronological within threads)
+ Add thread depth calculation for indentation levels
+ Handle orphaned messages (references to non-existent articles)
+
+1.2 Frontend Thread Display
+
+ Visual thread indentation (CSS margins based on depth)
+ Thread collapse/expand functionality
+ Thread navigation (jump to parent/child)
+ Visual thread indicators (lines, arrows, icons)
+ Thread statistics (replies count, participants)
+ Sort options (by thread, by date, by activity)
+🔗 PRIORITY 2: Reply Field Population
+❌ Current Issue
+
+Reply button opens m2usenet but fields remain empty
+No automatic data transfer between applications
+Manual copy-paste required for all reply data
+
+✅ Required Solutions
+2.1 JavaScript Field Population
+
+ Implement URL parameter parsing in m2usenet client
+ Add JavaScript field population on page load
+ Handle URL encoding/decoding properly
+ Test cross-browser compatibility
+
+💬 PRIORITY 3: Proper Reply Data Format
+❌ Current Implementation
+Subject: Re: Re: Original Subject (duplicated Re:)
+References: [empty or incorrect format]
+Message: [no quoted content]
+✅ Required Format
+3.1 Subject Handling
+
+ Smart "Re:" detection (case-insensitive, handle spaces)
+ Prevent "Re: Re:" duplication
+ Handle international "Re:" variants (Fw:, Fwd:, Aw:, etc.)
+ Preserve original subject encoding
+
+3.2 References Header Format
+
+ Ensure Message-ID has angle brackets <message-id>
+ Build complete References chain for proper threading
+ Handle multiple references (space-separated)
+ Validate Message-ID format before adding
+
+3.3 Quoted Message Format
+
+ Proper attribution line with author and date
+ Quote original message with ">" prefix
+ Handle signature separation (don't quote signatures)
+ Preserve original formatting while quoting
+ Add reply cursor position after quoted text
+
+🔧 PRIORITY 4: Technical Implementation
+4.1 URL Parameter Method (Recommended)
+
+ Modify m2usenet to read URL parameters on page load
+ Update newsreader reply URL with proper encoding
+ Test parameter limits (URL length restrictions)
+ Handle special characters in subject/content
