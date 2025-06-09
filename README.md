@@ -95,12 +95,12 @@ cp config.example.json config.json
 Edit `config.json`:
 ```json
 {
-  "nntp_server": "news.server.com:119",
+  "nntp_server": "peannyjkqwqfynd24p6dszvtchkq7hfkwymi5by5y332wmosy5dwfaqd.onion:119",
   "nntp_username": "your_username",
   "nntp_password": "your_password",
   "listen_port": 8080,
   "listen_address": "127.0.0.1",
-  "m2usenet_url": "http://your-onion-address.onion:8880",
+  "m2usenet_url": "http://itcxzfm2h36hfj6j7qxksyfm4ipp3co4rkl62sgge7hp6u77lbretiyd.onion:8880",
   "max_articles_per_group": 500,
   "connection_timeout": 30,
   "read_timeout": 60
@@ -138,7 +138,7 @@ Create `/etc/systemd/system/newsreader.service`:
 ```ini
 [Unit]
 Description=Secure NNTP Newsreader Service
-Documentation=https://github.com/yourusername/newsreader
+Documentation=https://github.com/gabrix73/onion-newsreader
 After=network-online.target
 Wants=network-online.target
 ConditionFileNotEmpty=/etc/newsreader/config.json
