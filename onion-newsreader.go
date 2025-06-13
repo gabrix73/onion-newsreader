@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -38,6 +37,21 @@ type ArticleOverview struct {
 	References  string
 	ByteCount   int
 	LineCount   int
+	ParsedDate  time.Time
+}
+
+type ThreadNode struct {
+	Article  *ArticleOverview
+	Children []*ThreadNode
+	Level    int
+	IsRoot   bool
+}
+
+type Thread struct {
+	Root         *ThreadNode
+	ArticleCount int
+	LastDate     time.Time
+	Subject      string
 }
 
 type NNTPClient struct {
@@ -694,15 +708,36 @@ func (c *NNTPClient) parseOverviewLine(line string) *ArticleOverview {
 	byteCount, _ := strconv.Atoi(parts[6])
 	lineCount, _ := strconv.Atoi(parts[7])
 
+	// Parse the date for threading
+	parsedDate := time.Now() // fallback
+	if dateStr := strings.TrimSpace(parts[3]); dateStr != "" {
+		// Try common date formats
+		formats := []string{
+			time.RFC1123Z,
+			time.RFC1123,
+			"Mon, 2 Jan 2006 15:04:05 -0700",
+			"2 Jan 2006 15:04:05 -0700",
+			"Mon, 2 Jan 2006 15:04:05 MST",
+		}
+		
+		for _, format := range formats {
+			if parsed, err := time.Parse(format, dateStr); err == nil {
+				parsedDate = parsed
+				break
+			}
+		}
+	}
+
 	return &ArticleOverview{
 		Number:     number,
 		Subject:    parts[1],
 		From:       parts[2],
 		Date:       parts[3],
-		MessageID:  parts[4],
-		References: parts[5],
+		MessageID:  strings.TrimSpace(parts[4]),
+		References: strings.TrimSpace(parts[5]),
 		ByteCount:  byteCount,
 		LineCount:  lineCount,
+		ParsedDate: parsedDate,
 	}
 }
 
@@ -809,6 +844,267 @@ func (c *NNTPClient) disconnect() {
 	c.isConnected = false
 	c.connectedServer = ""
 	c.isOnionService = false
+}
+
+// Threading functions
+func buildThreads(articles []*ArticleOverview) []*Thread {
+	log.Printf("🧵 Building threads from %d articles...", len(articles))
+	
+	// Maps for fast lookup
+	articlesByMessageID := make(map[string]*ArticleOverview)
+	articlesBySubject := make(map[string][]*ArticleOverview)
+	
+	// Index articles
+	for _, article := range articles {
+		if article.MessageID != "" {
+			articlesByMessageID[article.MessageID] = article
+		}
+		
+		// Normalize subject for threading
+		normalizedSubject := normalizeSubject(article.Subject)
+		articlesBySubject[normalizedSubject] = append(articlesBySubject[normalizedSubject], article)
+	}
+	
+	// Build thread trees
+	threadRoots := make(map[string]*ThreadNode)
+	processedArticles := make(map[string]bool)
+	
+	for _, article := range articles {
+		if processedArticles[article.MessageID] {
+			continue
+		}
+		
+		// Find root of this thread
+		root := findOrCreateThreadRoot(article, articlesByMessageID, threadRoots)
+		buildThreadTree(root, article, articlesByMessageID, processedArticles)
+	}
+	
+	// Convert to Thread structs and sort
+	var threads []*Thread
+	for _, root := range threadRoots {
+		thread := &Thread{
+			Root:         root,
+			ArticleCount: countArticlesInThread(root),
+			LastDate:     findLatestDateInThread(root),
+			Subject:      root.Article.Subject,
+		}
+		threads = append(threads, thread)
+	}
+	
+	// Sort threads by last activity
+	sort.Slice(threads, func(i, j int) bool {
+		return threads[i].LastDate.After(threads[j].LastDate)
+	})
+	
+	log.Printf("✅ Built %d threads from %d articles", len(threads), len(articles))
+	return threads
+}
+
+func normalizeSubject(subject string) string {
+	// Remove Re:, Fwd:, etc.
+	subject = strings.TrimSpace(subject)
+	
+	// Common prefixes to remove
+	prefixes := []string{
+		"Re:", "RE:", "re:", "Fwd:", "FWD:", "fwd:", 
+		"Fw:", "FW:", "fw:", "AW:", "aw:", "Antw:",
+	}
+	
+	for {
+		trimmed := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(subject, prefix) {
+				subject = strings.TrimSpace(subject[len(prefix):])
+				trimmed = true
+				break
+			}
+		}
+		if !trimmed {
+			break
+		}
+	}
+	
+	return strings.ToLower(subject)
+}
+
+func findOrCreateThreadRoot(article *ArticleOverview, articlesByMessageID map[string]*ArticleOverview, threadRoots map[string]*ThreadNode) *ThreadNode {
+	// If no references, this is a root
+	if article.References == "" {
+		normalizedSubject := normalizeSubject(article.Subject)
+		if root, exists := threadRoots[normalizedSubject]; exists {
+			return root
+		}
+		
+		root := &ThreadNode{
+			Article: article,
+			Level:   0,
+			IsRoot:  true,
+		}
+		threadRoots[normalizedSubject] = root
+		return root
+	}
+	
+	// Find the root by following references
+	references := parseReferences(article.References)
+	if len(references) == 0 {
+		normalizedSubject := normalizeSubject(article.Subject)
+		if root, exists := threadRoots[normalizedSubject]; exists {
+			return root
+		}
+		
+		root := &ThreadNode{
+			Article: article,
+			Level:   0,
+			IsRoot:  true,
+		}
+		threadRoots[normalizedSubject] = root
+		return root
+	}
+	
+	// The first reference is usually the thread root
+	rootMessageID := references[0]
+	if rootArticle, exists := articlesByMessageID[rootMessageID]; exists {
+		normalizedSubject := normalizeSubject(rootArticle.Subject)
+		if root, exists := threadRoots[normalizedSubject]; exists {
+			return root
+		}
+		
+		root := &ThreadNode{
+			Article: rootArticle,
+			Level:   0,
+			IsRoot:  true,
+		}
+		threadRoots[normalizedSubject] = root
+		return root
+	}
+	
+	// Fallback: use subject-based threading
+	normalizedSubject := normalizeSubject(article.Subject)
+	if root, exists := threadRoots[normalizedSubject]; exists {
+		return root
+	}
+	
+	root := &ThreadNode{
+		Article: article,
+		Level:   0,
+		IsRoot:  true,
+	}
+	threadRoots[normalizedSubject] = root
+	return root
+}
+
+func buildThreadTree(root *ThreadNode, article *ArticleOverview, articlesByMessageID map[string]*ArticleOverview, processedArticles map[string]bool) {
+	if processedArticles[article.MessageID] {
+		return
+	}
+	
+	processedArticles[article.MessageID] = true
+	
+	// If this is the root article, we're done
+	if root.Article.MessageID == article.MessageID {
+		return
+	}
+	
+	// Find where to insert this article in the tree
+	insertLocation := findInsertLocation(root, article, articlesByMessageID)
+	
+	newNode := &ThreadNode{
+		Article: article,
+		Level:   insertLocation.Level + 1,
+		IsRoot:  false,
+	}
+	
+	insertLocation.Children = append(insertLocation.Children, newNode)
+	
+	// Sort children by date
+	sort.Slice(insertLocation.Children, func(i, j int) bool {
+		return insertLocation.Children[i].Article.ParsedDate.Before(insertLocation.Children[j].Article.ParsedDate)
+	})
+}
+
+func findInsertLocation(root *ThreadNode, article *ArticleOverview, articlesByMessageID map[string]*ArticleOverview) *ThreadNode {
+	references := parseReferences(article.References)
+	if len(references) == 0 {
+		return root
+	}
+	
+	// Find the parent by looking for the last reference that exists in our tree
+	var parent *ThreadNode = root
+	
+	for i := len(references) - 1; i >= 0; i-- {
+		parentMessageID := references[i]
+		if foundParent := findNodeByMessageID(root, parentMessageID); foundParent != nil {
+			parent = foundParent
+			break
+		}
+	}
+	
+	return parent
+}
+
+func findNodeByMessageID(node *ThreadNode, messageID string) *ThreadNode {
+	if node.Article.MessageID == messageID {
+		return node
+	}
+	
+	for _, child := range node.Children {
+		if found := findNodeByMessageID(child, messageID); found != nil {
+			return found
+		}
+	}
+	
+	return nil
+}
+
+func parseReferences(references string) []string {
+	if references == "" {
+		return nil
+	}
+	
+	// Split by whitespace and clean up
+	var messageIDs []string
+	parts := strings.Fields(references)
+	
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "<") && strings.HasSuffix(part, ">") {
+			messageIDs = append(messageIDs, part)
+		}
+	}
+	
+	return messageIDs
+}
+
+func countArticlesInThread(node *ThreadNode) int {
+	count := 1
+	for _, child := range node.Children {
+		count += countArticlesInThread(child)
+	}
+	return count
+}
+
+func findLatestDateInThread(node *ThreadNode) time.Time {
+	latest := node.Article.ParsedDate
+	
+	for _, child := range node.Children {
+		childLatest := findLatestDateInThread(child)
+		if childLatest.After(latest) {
+			latest = childLatest
+		}
+	}
+	
+	return latest
+}
+
+func flattenThread(node *ThreadNode) []*ArticleOverview {
+	var articles []*ArticleOverview
+	articles = append(articles, node.Article)
+	
+	for _, child := range node.Children {
+		articles = append(articles, flattenThread(child)...)
+	}
+	
+	return articles
 }
 
 func (s *NewsServer) GetHealthStatus() map[string]interface{} {
@@ -1043,6 +1339,51 @@ func (s *NewsServer) handleActive(w http.ResponseWriter, r *http.Request) {
         .success { color: #00ff00; }
         .error { color: #ff8800; }
         .progress { margin: 10px 0; font-size: 0.9em; color: #888; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -1061,6 +1402,14 @@ func (s *NewsServer) handleActive(w http.ResponseWriter, r *http.Request) {
             </p>
             <p class="progress"><em>Started at ` + time.Now().Format("15:04:05") + `</em></p>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
     <script>
         let checkCount = 0;
@@ -1110,6 +1459,23 @@ func (s *NewsServer) handleActive(w http.ResponseWriter, r *http.Request) {
             clearInterval(interval);
             document.getElementById('progress-text').innerHTML = '⏰ Status checking stopped - please refresh page manually';
         }, 10 * 60 * 1000);
+
+        function fallbackCopyXMR(event) {
+            const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+            
+            if (!navigator.userAgent.includes('Monero')) {
+                event.preventDefault();
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(xmrAddress).then(() => {
+                        alert("✅ XMR address copied to clipboard!");
+                    }).catch(() => {
+                        prompt("Copy XMR address:", xmrAddress);
+                    });
+                } else {
+                    prompt("Copy XMR address:", xmrAddress);
+                }
+            }
+        }
     </script>
 </body>
 </html>`
@@ -1154,6 +1520,51 @@ func (s *NewsServer) handleActive(w http.ResponseWriter, r *http.Request) {
         .back-link:hover { color: #00ff00; }
         .warning { background: #2a1a00; border: 1px solid #ffaa00; color: #ffaa00; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
         .success { background: #002a1a; border: 1px solid #00aa00; color: #00aa00; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -1200,7 +1611,34 @@ func (s *NewsServer) handleActive(w http.ResponseWriter, r *http.Request) {
             {{end}}
         </div>
         {{end}}
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 
@@ -1257,6 +1695,51 @@ func (s *NewsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
         .back-link:hover { color: #00ff00; }
         .test-button { background: #333; color: #00ff00; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 5px; }
         .test-button:hover { background: #555; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -1356,16 +1839,42 @@ func (s *NewsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
                 <li>✅ Connection retry logic</li>
                 <li>✅ Broken pipe recovery</li>
                 <li>✅ Diagnostic testing</li>
+                <li>✅ Thread-based article grouping</li>
             </ul>
         </div>
         
         <p><a href="/" class="back-link">← Back to Home</a> | <a href="/active" class="back-link">Active Groups</a></p>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
     
     <script>
         setTimeout(function() {
             window.location.reload();
         }, 30000);
+
+        function fallbackCopyXMR(event) {
+            const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+            
+            if (!navigator.userAgent.includes('Monero') {
+                event.preventDefault();
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(xmrAddress).then(() => {
+                        alert("✅ XMR address copied to clipboard!");
+                    }).catch(() => {
+                        prompt("Copy XMR address:", xmrAddress);
+                    });
+                } else {
+                    prompt("Copy XMR address:", xmrAddress);
+                }
+            }
+        }
     </script>
 </body>
 </html>`
@@ -1432,6 +1941,51 @@ func (s *NewsServer) handleTestOnion(w http.ResponseWriter, r *http.Request) {
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .test-progress { display: none; }
         pre { background: #0a0a0a; padding: 10px; border-radius: 3px; overflow-x: auto; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -1490,7 +2044,7 @@ func (s *NewsServer) handleTestOnion(w http.ResponseWriter, r *http.Request) {
         
         <div class="test-box">
             <h3>📡 NNTP Protocol Information</h3>
-            <p><strong>Protocol type:</strong> NNTP Client (newsreader) - <strong>READ-ONLY</strong></p>
+            <p><strong>Protocol type:</strong> NNTP Client (newsreader) with <strong>Thread Support</strong></p>
             <p><strong>Commands used:</strong></p>
             <ul style="margin: 10px 0 0 20px; font-family: monospace; font-size: 0.9em;">
                 <li><code>MODE READER</code> - Enter reader mode</li>
@@ -1501,15 +2055,15 @@ func (s *NewsServer) handleTestOnion(w http.ResponseWriter, r *http.Request) {
                 <li><code>DATE</code>/<code>HELP</code> - Health check</li>
                 <li><code>QUIT</code> - Close connection</li>
             </ul>
-            <p><strong>NOT used:</strong> <code>IHAVE</code>, <code>POST</code>, <code>TAKETHIS</code> (server-to-server/posting commands)</p>
+            <p><strong>Features:</strong> Thread-based article grouping using References headers</p>
             
             <div style="margin-top: 15px; padding: 10px; background: #1a2a1a; border-radius: 5px;">
-                <strong>ℹ️ Technical details:</strong>
+                <strong>🧵 Threading Features:</strong>
                 <ul style="margin: 10px 0 0 20px;">
-                    <li>This is a <strong>newsreader client</strong>, not an NNTP server</li>
-                    <li>Read-only access - no posting capabilities</li>
-                    <li>Uses standard RFC 3977 NNTP commands</li>
-                    <li>All traffic routed through SOCKS5 (Tor)</li>
+                    <li>Automatic thread building using References headers</li>
+                    <li>Subject-based fallback threading</li>
+                    <li>Hierarchical reply display with indentation</li>
+                    <li>Chronological sorting within threads</li>
                 </ul>
             </div>
         </div>
@@ -1539,6 +2093,14 @@ timeout 60 curl --socks5 127.0.0.1:9050 -v \\
                 <li>Check Tor logs: <code>journalctl -u tor -f</code></li>
             </ul>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
     
     <script>
@@ -1586,6 +2148,23 @@ timeout 60 curl --socks5 127.0.0.1:9050 -v \\
             }
             
             showResult('info', '💡 For full test, try downloading the active file from the main page');
+        }
+
+        function fallbackCopyXMR(event) {
+            const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+            
+            if (!navigator.userAgent.includes('Monero')) {
+                event.preventDefault();
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(xmrAddress).then(() => {
+                        alert("✅ XMR address copied to clipboard!");
+                    }).catch(() => {
+                        prompt("Copy XMR address:", xmrAddress);
+                    });
+                } else {
+                    prompt("Copy XMR address:", xmrAddress);
+                }
+            }
         }
     </script>
 </body>
@@ -1707,13 +2286,58 @@ func (s *NewsServer) handleHome(w http.ResponseWriter, r *http.Request) {
         .alert-error { background: #2a1a1a; border: 1px solid #ff8800; color: #ff8800; }
         .alert-warning { background: #2a2a1a; border: 1px solid #ffaa00; color: #ffaa00; }
         .alert-info { background: #1a2a2a; border: 1px solid #00aaff; color: #00aaff; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🧅 Onion Newsreader</h1>
-            <p>Anonymous NNTP Client via Tor • Secure Newsgroup Access</p>
+            <p>Anonymous NNTP Client via Tor • Secure Newsgroup Access • Thread Support</p>
         </div>
 
         {{if eq .ConnectionStatus "tor-proxy-failed"}}
@@ -1745,6 +2369,7 @@ func (s *NewsServer) handleHome(w http.ResponseWriter, r *http.Request) {
             <p>🌐 Tor Proxy: <span class="status-{{.TorStatusClass}}">{{.TorStatus}}</span></p>
             <p>📡 NNTP: <span class="status-{{.ConnectionStatusClass}}">{{.ConnectionStatus}}</span></p>
             <p>📊 Cached Groups: <span class="status-good">{{.GroupCount}}</span></p>
+            <p>🧵 Threading: <span class="status-good">Enabled</span></p>
             <p>🔗 Session: <code>{{.Session}}</code></p>
             <p>⚡ <a href="/health" style="color: #00aaff;">Detailed Health Check</a></p>
         </div>
@@ -1806,9 +2431,37 @@ func (s *NewsServer) handleHome(w http.ResponseWriter, r *http.Request) {
         <div class="footer">
             <p>🔒 All connections are routed through Tor for maximum anonymity</p>
             <p>🧅 Primary: Onion service • 🔄 Fallback: news.tcpreset.net via Tor (anonymous)</p>
+            <p>🧵 Thread-based article organization for better discussion flow</p>
             <p>✍️ Posting URL: <code>http://itcxzfm2h36hfj6j7qxksyfm4ipp3co4rkl62sgge7hp6u77lbretiyd.onion:8880/</code></p>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 
@@ -1869,6 +2522,51 @@ func (s *NewsServer) handleSearch(w http.ResponseWriter, r *http.Request) {
         .examples ul { margin: 10px 0 0 20px; }
         .examples li { margin: 5px 0; }
         .examples code { background: #0a0a0a; padding: 2px 4px; border-radius: 2px; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -1899,7 +2597,34 @@ func (s *NewsServer) handleSearch(w http.ResponseWriter, r *http.Request) {
             <p><strong>Wildcards:</strong> Use <code>*</code> to match any characters</p>
             <p><strong>Case:</strong> Search is case-insensitive</p>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 		w.Write([]byte(searchFormHTML))
@@ -1924,6 +2649,51 @@ func (s *NewsServer) handleSearch(w http.ResponseWriter, r *http.Request) {
         .back-link { color: #00aaff; text-decoration: none; }
         .back-link:hover { color: #00ff00; }
         .warning { background: #2a1a00; border: 1px solid #ffaa00; color: #ffaa00; padding: 15px; border-radius: 8px; margin: 20px 0; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -1936,7 +2706,34 @@ func (s *NewsServer) handleSearch(w http.ResponseWriter, r *http.Request) {
             <p>No newsgroups are currently cached. You need to download the active file first.</p>
             <p><a href="/active?refresh=1" style="color: #00aaff;">📥 Download Active File</a></p>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 		w.Write([]byte(noGroupsHTML))
@@ -1995,6 +2792,51 @@ func (s *NewsServer) handleSearch(w http.ResponseWriter, r *http.Request) {
         .back-link:hover { color: #00ff00; }
         .warning { background: #2a1a00; border: 1px solid #ffaa00; color: #ffaa00; padding: 15px; border-radius: 8px; margin: 20px 0; }
         .info { background: #1a2a2a; border: 1px solid #0088aa; color: #0088aa; padding: 15px; border-radius: 8px; margin: 20px 0; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -2044,7 +2886,34 @@ func (s *NewsServer) handleSearch(w http.ResponseWriter, r *http.Request) {
             {{end}}
         </div>
         {{end}}
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 
@@ -2100,6 +2969,51 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
         .back-link { color: #00aaff; text-decoration: none; }
         .back-link:hover { color: #00ff00; }
         .error { background: #2a1a1a; border: 1px solid #aa0000; color: #aa0000; padding: 15px; border-radius: 8px; margin: 20px 0; }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -2118,15 +3032,42 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
             </ul>
             <p><a href="/active?refresh=1" style="color: #00aaff;">🔄 Refresh Group Cache</a></p>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 		w.Write([]byte(notFoundHTML))
 		return
 	}
 	
-	// Try to get articles for this group
-	var articles []*ArticleOverview
+	// Try to get articles for this group and build threads
+	var threads []*Thread
 	var articleCount, low, high int
 	var connectionError string
 	
@@ -2138,10 +3079,13 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			connectionError = fmt.Sprintf("Failed to select group: %v", err)
 		} else {
-			maxArticles := 100  // Limit to prevent huge pages
-			articles, err = s.client.GetArticleOverview(low, high, maxArticles)
+			maxArticles := 200  // Increased for better threading
+			articles, err := s.client.GetArticleOverview(low, high, maxArticles)
 			if err != nil {
 				connectionError = fmt.Sprintf("Failed to get articles: %v", err)
+			} else {
+				// Build threads from articles
+				threads = buildThreads(articles)
 			}
 		}
 	}
@@ -2156,26 +3100,60 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
         .container { max-width: 1200px; margin: 0 auto; }
         .header { background: #1a1a1a; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; }
         .group-info { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; }
-        .article-list { background: #1a1a1a; padding: 20px; border-radius: 8px; border: 1px solid #333; }
-        .article-item { 
-            padding: 12px; 
-            margin: 5px 0; 
+        .thread-list { background: #1a1a1a; padding: 20px; border-radius: 8px; border: 1px solid #333; }
+        .thread-item { 
+            margin: 10px 0; 
+            padding: 15px; 
             background: #0a0a0a; 
-            border-radius: 3px; 
-            border-left: 3px solid #333; 
+            border-radius: 5px; 
+            border-left: 4px solid #333; 
         }
-        .article-item:hover { 
+        .thread-item:hover { 
             background: #1a1a0a; 
             border-left-color: #ffaa00; 
         }
-        .article-subject { 
+        .thread-subject { 
             color: #00aaff; 
             font-weight: bold; 
-            margin-bottom: 5px; 
+            margin-bottom: 8px; 
         }
-        .article-meta { 
+        .thread-subject a { 
+            color: #00aaff; 
+            text-decoration: none; 
+        }
+        .thread-subject a:hover { 
+            color: #00ff00; 
+        }
+        .thread-meta { 
             color: #888; 
             font-size: 0.9em; 
+            margin-bottom: 10px;
+        }
+        .thread-replies { 
+            margin-left: 20px; 
+            border-left: 2px solid #333; 
+            padding-left: 15px; 
+        }
+        .reply-item { 
+            margin: 5px 0; 
+            padding: 8px; 
+            background: #1a1a1a; 
+            border-radius: 3px; 
+            font-size: 0.9em;
+        }
+        .reply-subject { 
+            color: #00aaff; 
+        }
+        .reply-subject a { 
+            color: #00aaff; 
+            text-decoration: none; 
+        }
+        .reply-subject a:hover { 
+            color: #00ff00; 
+        }
+        .reply-meta { 
+            color: #666; 
+            font-size: 0.8em; 
         }
         .back-link { color: #00aaff; text-decoration: none; }
         .back-link:hover { color: #00ff00; }
@@ -2184,7 +3162,6 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
         .info { background: #1a2a2a; border: 1px solid #0088aa; color: #0088aa; padding: 15px; border-radius: 8px; margin: 20px 0; }
         .refresh-btn { background: #333; color: #00ff00; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin: 10px 5px; }
         .refresh-btn:hover { background: #555; }
-        .pagination { text-align: center; margin: 20px 0; }
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
         .stat-item { background: #0a0a0a; padding: 10px; border-radius: 4px; text-align: center; }
         .posting-section { background: #1a1a1a; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; text-align: center; }
@@ -2214,6 +3191,55 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
             padding: 10px; 
             border-radius: 4px; 
             border-left: 3px solid #ffaa00;
+        }
+        .thread-count {
+            color: #ffaa00;
+            font-weight: bold;
+        }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
         }
     </style>
 </head>
@@ -2246,6 +3272,9 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
                 <div class="stat-item">
                     <strong>📋 Status:</strong><br>{{.Status}}
                 </div>
+                <div class="stat-item">
+                    <strong>🧵 Threads:</strong><br><span class="thread-count">{{.ThreadCount}}</span>
+                </div>
             </div>
         </div>
 
@@ -2271,28 +3300,54 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
         </div>
         {{end}}
 
-        {{if .Articles}}
-        <div class="article-list">
-            <h3>📰 Recent Articles {{if .TruncatedView}}(showing last {{.MaxArticles}}){{end}}</h3>
+        {{if .Threads}}
+        <div class="thread-list">
+            <h3>🧵 Discussion Threads {{if .TruncatedView}}(showing recent {{.MaxArticles}} articles organized into threads){{end}}</h3>
             
-            {{range .Articles}}
-            <div class="article-item">
-                <div class="article-subject">
-                    <a href="/article/{{$.GroupName}}/{{.Number}}" style="color: #00aaff; text-decoration: none;">
-                        {{.Subject}}
-                    </a>
+            {{range .Threads}}
+            <div class="thread-item">
+                <div class="thread-subject">
+                    <a href="/article/{{$.GroupName}}/{{.Root.Article.Number}}">{{.Subject}}</a>
                 </div>
-                <div class="article-meta">
-                    <strong>From:</strong> {{.From}} | 
-                    <strong>Date:</strong> {{.Date}} | 
-                    <strong>Article:</strong> {{.Number}} | 
-                    <strong>Size:</strong> {{.ByteCount}} bytes ({{.LineCount}} lines)
+                <div class="thread-meta">
+                    <strong>Started by:</strong> {{.Root.Article.From}} • 
+                    <strong>Articles:</strong> {{.ArticleCount}} • 
+                    <strong>Last activity:</strong> {{.LastDate.Format "Jan 2, 2006 15:04"}}
                 </div>
+                
+                {{if .Root.Children}}
+                <div class="thread-replies">
+                    {{range .Root.Children}}
+                    <div class="reply-item">
+                        <div class="reply-subject">
+                            <a href="/article/{{$.GroupName}}/{{.Article.Number}}">{{.Article.Subject}}</a>
+                        </div>
+                        <div class="reply-meta">
+                            By {{.Article.From}} • {{.Article.ParsedDate.Format "Jan 2, 15:04"}}
+                        </div>
+                        
+                        {{if .Children}}
+                        {{range .Children}}
+                        <div class="reply-item" style="margin-left: 15px; border-left: 1px solid #555; padding-left: 10px;">
+                            <div class="reply-subject">
+                                <a href="/article/{{$.GroupName}}/{{.Article.Number}}">{{.Article.Subject}}</a>
+                            </div>
+                            <div class="reply-meta">
+                                By {{.Article.From}} • {{.Article.ParsedDate.Format "Jan 2, 15:04"}}
+                            </div>
+                        </div>
+                        {{end}}
+                        {{end}}
+                    </div>
+                    {{end}}
+                </div>
+                {{end}}
             </div>
             {{end}}
             
             {{if .TruncatedView}}
             <div class="info">
+                <p><strong>🧵 Threading Info:</strong> Articles are automatically organized into conversation threads using References headers and subject matching.</p>
                 <p><strong>ℹ️ Note:</strong> Only showing the most recent {{.MaxArticles}} articles to prevent slow loading.</p>
                 <p>Use a dedicated newsreader client for full group browsing and threading.</p>
             </div>
@@ -2315,23 +3370,45 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
         <div class="info">
             <h3>💡 Navigation Tips</h3>
             <ul>
-                <li><strong>Click article subjects</strong> to read full articles</li>
-                <li><strong>Use browser back</strong> to return to this group view</li>
-                <li><strong>Search for similar groups</strong> using the pattern above</li>
-                <li><strong>Recent articles shown first</strong> (newest at top)</li>
+                <li><strong>🧵 Threaded view:</strong> Articles are grouped by conversation thread</li>
+                <li><strong>Click thread subjects</strong> to read the original post</li>
+                <li><strong>Click reply subjects</strong> to read individual replies</li>
+                <li><strong>Indentation shows</strong> the reply hierarchy</li>
+                <li><strong>Recent threads first</strong> based on last activity</li>
             </ul>
         </div>
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 
 	tmpl, _ := template.New("group").Parse(groupHTML)
-	
-	// Reverse articles to show newest first
-	for i := len(articles)/2 - 1; i >= 0; i-- {
-		opp := len(articles) - 1 - i
-		articles[i], articles[opp] = articles[opp], articles[i]
-	}
 	
 	// Generate search pattern for similar groups
 	groupPattern := ""
@@ -2349,11 +3426,12 @@ func (s *NewsServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 		"CachedHigh":        groupInfo.High, 
 		"CachedCount":       groupInfo.High - groupInfo.Low + 1,
 		"Status":            groupInfo.Status,
-		"Articles":          articles,
+		"Threads":           threads,
+		"ThreadCount":       len(threads),
 		"ConnectionError":   connectionError,
 		"LiveStats":         connectionError == "",
-		"MaxArticles":       100,
-		"TruncatedView":     len(articles) >= 100,
+		"MaxArticles":       200,
+		"TruncatedView":     len(threads) > 0,
 		"EncodedGroupName":  url.QueryEscape(groupName),
 	}
 	
@@ -2496,6 +3574,51 @@ func (s *NewsServer) handleArticle(w http.ResponseWriter, r *http.Request) {
             border-radius: 4px; 
             border-left: 3px solid #00aaff;
         }
+        .app-footer {
+            margin-top: 40px;
+            padding: 25px 0;
+            border-top: 2px solid #333;
+            background: #1a1a1a;
+            text-align: center;
+        }
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            flex-wrap: wrap;
+        }
+        .footer-links a {
+            color: #00aaff;
+            text-decoration: none;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 20px;
+            background: rgba(0, 170, 255, 0.1);
+            transition: all 0.3s ease;
+            border: 1px solid rgba(0, 170, 255, 0.2);
+        }
+        .footer-links a:hover {
+            background: #00aaff;
+            color: #0a0a0a;
+        }
+        .footer-links a[href^="monero:"] {
+            background: rgba(255, 102, 0, 0.1);
+            color: #ff6600;
+            border-color: rgba(255, 102, 0, 0.2);
+        }
+        .footer-links a[href^="monero:"]:hover {
+            background: #ff6600;
+            color: #0a0a0a;
+        }
+        .footer-links a[href*="github"] {
+            background: rgba(51, 51, 51, 0.1);
+            color: #00ff00;
+            border-color: rgba(51, 51, 51, 0.2);
+        }
+        .footer-links a[href*="github"]:hover {
+            background: #00ff00;
+            color: #0a0a0a;
+        }
     </style>
 </head>
 <body>
@@ -2511,16 +3634,16 @@ func (s *NewsServer) handleArticle(w http.ResponseWriter, r *http.Request) {
         <div class="reply-section">
             <h3>💬 Reply to this Article</h3>
             <p>Reply to article by <strong>{{.From}}</strong> in <strong>{{.GroupName}}</strong></p>
-            <a href="http://itcxzfm2h36hfj6j7qxksyfm4ipp3co4rkl62sgge7hp6u77lbretiyd.onion:8880/" target="_blank" class="reply-button">
-                💬 OPEN POSTING SERVICE
+            <a href="http://itcxzfm2h36hfj6j7qxksyfm4ipp3co4rkl62sgge7hp6u77lbretiyd.onion:8880/#send{{if .EncodedGroupName}}?newsgroups={{.EncodedGroupName}}{{end}}{{if .EncodedSubject}}&subject={{.EncodedSubject}}{{end}}{{if .EncodedMessageID}}&references={{.EncodedMessageID}}{{end}}{{if .EncodedQuotedContent}}&message={{.EncodedQuotedContent}}{{end}}" target="_blank" class="reply-button">
+                💬 REPLY TO POST
             </a>
             <p class="reply-note">
-                <strong>ℹ️ For Your Reply:</strong><br>
-                {{if .Subject}}• <strong>Subject:</strong> {{.Subject}}<br>{{end}}
+                <strong>ℹ️ Reply Pre-filled Data:</strong><br>
+                {{if .Subject}}• <strong>Subject:</strong> Re: {{.Subject}}<br>{{end}}
                 {{if .MessageID}}• <strong>References:</strong> {{.MessageID}}<br>{{end}}
                 • <strong>Newsgroups:</strong> {{.GroupName}}<br>
-                • <strong>Original Author:</strong> {{.From}}<br>
-                • Use <strong>Tor Browser</strong> to access posting service
+                • <strong>Message:</strong> Quoted original content included<br>
+                • <strong>Direct to:</strong> Send Message tab with pre-filled fields
             </p>
         </div>
         {{end}}
@@ -2609,16 +3732,44 @@ func (s *NewsServer) handleArticle(w http.ResponseWriter, r *http.Request) {
         <div class="info">
             <h3>💡 Navigation Tips</h3>
             <ul>
-                <li><strong>Use browser back button</strong> to return to group view</li>
+                <li><strong>Use browser back button</strong> to return to threaded group view</li>
                 <li><strong>References header</strong> shows message threading</li>
                 <li><strong>Message-ID</strong> is unique identifier for this article</li>
                 <li><strong>Quoted text</strong> appears dimmed and indented</li>
                 <li><strong>Signatures</strong> appear separated and dimmed</li>
+                <li><strong>Threading</strong> organizes related posts in conversation flow</li>
             </ul>
         </div>
         
         {{end}}
+        
+        <footer class="app-footer">
+            <div class="footer-links">
+                <a href="https://github.com/gabrix73/onion-newsreader.git" target="_blank" rel="noopener">📁 Source Code</a>
+                <a href="monero:44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L" onclick="fallbackCopyXMR(event)">⚡ Support Project</a>
+                <a href="https://www.virebent.art" target="_blank" rel="noopener">🌐 virebent.art</a>
+            </div>
+        </footer>
     </div>
+    
+    <script>
+    function fallbackCopyXMR(event) {
+        const xmrAddress = "44L7s3EK6WngbNEZUKBeHwWWTgafpYX98MDaz2LSxkTHWtqPcnhiqzgXC9rjb45VHbWeesdgp2tcR9y5ApegoszyNMemz4L";
+        
+        if (!navigator.userAgent.includes('Monero')) {
+            event.preventDefault();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(xmrAddress).then(() => {
+                    alert("✅ XMR address copied to clipboard!");
+                }).catch(() => {
+                    prompt("Copy XMR address:", xmrAddress);
+                });
+            } else {
+                prompt("Copy XMR address:", xmrAddress);
+            }
+        }
+    }
+    </script>
 </body>
 </html>`
 
@@ -2707,9 +3858,7 @@ func (s *NewsServer) handleArticle(w http.ResponseWriter, r *http.Request) {
 			data["Subject"] = subject
 			// Add "Re: " if not already present for reply functionality
 			replySubject := subject
-			// Check if subject already starts with "Re:" (case insensitive, handle spaces)
-			subjectLower := strings.ToLower(strings.TrimSpace(subject))
-			if !strings.HasPrefix(subjectLower, "re:") {
+			if !strings.HasPrefix(strings.ToLower(subject), "re:") {
 				replySubject = "Re: " + subject
 			}
 			data["EncodedSubject"] = url.QueryEscape(replySubject)
@@ -2755,7 +3904,7 @@ func (s *NewsServer) handleArticle(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	log.Printf("📝 Logging initialized - writing to stdout and %s", "/var/log/onion-newsreader/onion-newsreader.log")
-	log.Printf("🧅 Onion Newsreader starting...")
+	log.Printf("🧅 Onion Newsreader starting with threading support...")
 
 	server := NewNewsServer()
 	defer server.client.Close()
@@ -2793,6 +3942,7 @@ func main() {
 	log.Printf("📡 Target NNTP: peannyjkqwqfynd24p6dszvtchkq7hfkwymi5by5y332wmosy5dwfaqd.onion:119")
 	log.Printf("🔄 Fallback NNTP: news.tcpreset.net:119 (anonymous access)")
 	log.Printf("✍️ Posting URL: http://itcxzfm2h36hfj6j7qxksyfm4ipp3co4rkl62sgge7hp6u77lbretiyd.onion:8880/")
+	log.Printf("🧵 Threading: Enabled (References + Subject-based)")
 	log.Printf("🔒 Stealth mode: true")
 	log.Printf("💬 Support contact: info@tcpreset.net")
 	log.Printf("🌐 Web interface ready - NNTP connection will be established in background")
