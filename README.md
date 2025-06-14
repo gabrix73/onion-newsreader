@@ -50,7 +50,7 @@ sudo pacman -S go git
 
 ### 1. Clone Repository
 ```bash
-git clone https://github.com/yourusername/newsreader.git
+git clone https://github.com/gabrix73/onion-newsreader.git
 cd newsreader
 ```
 
