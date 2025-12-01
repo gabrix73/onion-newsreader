@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"fmt"
 	"html/template"
@@ -245,14 +244,20 @@ func (c *NNTPClient) ListGroups() (map[string]*NewsgroupInfo, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	// Set a long deadline for the entire LIST operation (10 minutes)
+	c.conn.SetDeadline(time.Now().Add(10 * time.Minute))
+	defer c.conn.SetDeadline(time.Time{})
+
 	log.Printf("📤 Sending LIST command...")
 	if _, err := c.conn.Write([]byte("LIST\r\n")); err != nil {
-		return nil, err
+		c.isConnected = false
+		return nil, fmt.Errorf("failed to send LIST: %v", err)
 	}
 
 	resp, err := c.reader.ReadString('\n')
 	if err != nil {
-		return nil, err
+		c.isConnected = false
+		return nil, fmt.Errorf("failed to read LIST response: %v", err)
 	}
 	if !strings.HasPrefix(resp, "215") {
 		return nil, fmt.Errorf("LIST failed: %s", resp)
@@ -264,7 +269,8 @@ func (c *NNTPClient) ListGroups() (map[string]*NewsgroupInfo, error) {
 	for {
 		line, err := c.reader.ReadString('\n')
 		if err != nil {
-			return nil, fmt.Errorf("error reading groups at line %d: %v", lineCount, err)
+			c.isConnected = false
+			return nil, fmt.Errorf("error reading groups at line %d: %v (try again)", lineCount, err)
 		}
 		line = strings.TrimSpace(line)
 		if line == "." {
@@ -274,6 +280,8 @@ func (c *NNTPClient) ListGroups() (map[string]*NewsgroupInfo, error) {
 		lineCount++
 		if lineCount%5000 == 0 {
 			log.Printf("📊 Read %d groups...", lineCount)
+			// Reset deadline every 5000 groups to keep connection alive
+			c.conn.SetDeadline(time.Now().Add(10 * time.Minute))
 		}
 
 		parts := strings.Fields(line)
@@ -571,42 +579,51 @@ func (s *NewsServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	s.downloadStatus.mutex.Unlock()
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
+		maxRetries := 3
+		var lastErr error
 
-		done := make(chan error, 1)
-		go func() {
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			log.Printf("📥 Download attempt %d/%d...", attempt, maxRetries)
+			
+			// Force reconnect on retry
+			if attempt > 1 {
+				s.client.Close()
+				time.Sleep(5 * time.Second) // Wait before retry
+			}
+
 			groups, err := s.client.ListGroups()
 			if err != nil {
-				done <- err
-				return
+				lastErr = err
+				log.Printf("❌ Attempt %d failed: %v", attempt, err)
+				
+				s.downloadStatus.mutex.Lock()
+				s.downloadStatus.LastError = fmt.Sprintf("Attempt %d/%d: %v", attempt, maxRetries, err)
+				s.downloadStatus.mutex.Unlock()
+				
+				continue // Retry
 			}
+
+			// Success!
 			s.mutex.Lock()
 			s.groups = groups
 			s.mutex.Unlock()
 
 			s.downloadStatus.mutex.Lock()
 			s.downloadStatus.GroupCount = len(groups)
-			s.downloadStatus.mutex.Unlock()
-			done <- nil
-		}()
-
-		select {
-		case err := <-done:
-			s.downloadStatus.mutex.Lock()
 			s.downloadStatus.IsDownloading = false
-			if err != nil {
-				s.downloadStatus.LastError = err.Error()
-			} else {
-				s.downloadStatus.Completed = true
-			}
+			s.downloadStatus.Completed = true
+			s.downloadStatus.LastError = ""
 			s.downloadStatus.mutex.Unlock()
-		case <-ctx.Done():
-			s.downloadStatus.mutex.Lock()
-			s.downloadStatus.IsDownloading = false
-			s.downloadStatus.LastError = "timeout after 10 minutes"
-			s.downloadStatus.mutex.Unlock()
+			
+			log.Printf("✅ Downloaded %d groups", len(groups))
+			return
 		}
+
+		// All retries failed
+		s.downloadStatus.mutex.Lock()
+		s.downloadStatus.IsDownloading = false
+		s.downloadStatus.LastError = fmt.Sprintf("Failed after %d attempts: %v", maxRetries, lastErr)
+		s.downloadStatus.mutex.Unlock()
 	}()
 
 	tmpl := template.Must(template.New("download").Parse(downloadingTemplate))
@@ -850,6 +867,93 @@ func (s *NewsServer) handleArticle(w http.ResponseWriter, r *http.Request) {
 		"ReplyURL":    replyURL,
 		"M2UsenetURL": M2UsenetURL,
 	})
+}
+
+func (s *NewsServer) handleReply(w http.ResponseWriter, r *http.Request) {
+	// URL format: /reply/group.name/12345
+	path := strings.TrimPrefix(r.URL.Path, "/reply/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) < 2 {
+		http.Redirect(w, r, "/search", http.StatusFound)
+		return
+	}
+
+	groupName := strings.Join(parts[:len(parts)-1], "/")
+	articleNum, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		http.Error(w, "Invalid article number", http.StatusBadRequest)
+		return
+	}
+
+	var headers map[string]string
+	var body string
+
+	if err := s.client.ensureConnected(); err != nil {
+		http.Error(w, "Connection error: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	_, _, _, err = s.client.SelectGroup(groupName)
+	if err != nil {
+		http.Error(w, "Group error: "+err.Error(), http.StatusNotFound)
+		return
+	}
+
+	headers, body, err = s.client.GetArticle(articleNum)
+	if err != nil {
+		http.Error(w, "Article error: "+err.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Build reply subject
+	subject := headers["Subject"]
+	if subject != "" && !strings.HasPrefix(strings.ToLower(subject), "re:") {
+		subject = "Re: " + subject
+	}
+
+	// Build references
+	msgID := headers["Message-ID"]
+	if msgID != "" {
+		if !strings.HasPrefix(msgID, "<") {
+			msgID = "<" + msgID
+		}
+		if !strings.HasSuffix(msgID, ">") {
+			msgID = msgID + ">"
+		}
+	}
+
+	// Build quoted body
+	author := headers["From"]
+	date := headers["Date"]
+	
+	var quotedLines []string
+	quotedLines = append(quotedLines, fmt.Sprintf("On %s, %s wrote:", date, author))
+	quotedLines = append(quotedLines, "")
+	
+	// Quote each line of the original body
+	bodyLines := strings.Split(body, "\n")
+	for _, line := range bodyLines {
+		// Skip signature delimiter and everything after
+		if strings.TrimSpace(line) == "--" || strings.TrimSpace(line) == "-- " {
+			break
+		}
+		quotedLines = append(quotedLines, "> "+line)
+	}
+	quotedLines = append(quotedLines, "")
+	quotedLines = append(quotedLines, "")
+	
+	quotedBody := strings.Join(quotedLines, "\n")
+
+	// Redirect to m2usenet with all fields
+	redirectURL := fmt.Sprintf("%s?newsgroups=%s&subject=%s&references=%s&body=%s",
+		M2UsenetURL,
+		url.QueryEscape(groupName),
+		url.QueryEscape(subject),
+		url.QueryEscape(msgID),
+		url.QueryEscape(quotedBody))
+
+	http.Redirect(w, r, redirectURL, http.StatusFound)
 }
 
 func (s *NewsServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -1104,7 +1208,7 @@ const groupTemplate = `<!DOCTYPE html>
             </div>
             <div class="meta">
                 <span>{{.From}} | #{{.Number}}</span>
-                <a href="{{$.M2UsenetURL}}?newsgroups={{$.GroupName}}&subject={{urlquery .ReplySubject}}&references={{urlquery .ReplyRef}}" target="_blank" class="btn btn-reply">💬 Reply</a>
+                <a href="/reply/{{$.GroupName}}/{{.Number}}" target="_blank" class="btn btn-reply">💬 Reply</a>
             </div>
         </div>
         {{end}}
@@ -1148,8 +1252,8 @@ const articleTemplate = `<!DOCTYPE html>
                 <a href="/group/{{.GroupName}}">← {{.GroupName}}</a> |
                 <a href="/search">🔍 Search</a>
             </p>
-            {{if .ReplyURL}}
-            <a href="{{.ReplyURL}}" target="_blank" class="btn btn-reply">💬 Reply</a>
+            {{if .ArticleNum}}
+            <a href="/reply/{{.GroupName}}/{{.ArticleNum}}" target="_blank" class="btn btn-reply">💬 Reply</a>
             {{end}}
             <a href="{{.M2UsenetURL}}?newsgroups={{.GroupName}}" target="_blank" class="btn">📝 New Post</a>
         </div>
@@ -1236,6 +1340,7 @@ func main() {
 	http.HandleFunc("/search", server.handleSearch)
 	http.HandleFunc("/group/", server.handleGroup)
 	http.HandleFunc("/article/", server.handleArticle)
+	http.HandleFunc("/reply/", server.handleReply)
 	http.HandleFunc("/health", server.handleHealth)
 
 	log.Println("🚀 HTTP server on 127.0.0.1:8080")
